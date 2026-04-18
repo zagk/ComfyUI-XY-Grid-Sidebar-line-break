@@ -2,6 +2,7 @@ import { api } from "../../scripts/api.js";
 
 // ── session state ──────────────────────────────────────────────────────────
 let session = null; // null when idle
+let assembling = false; // guard against concurrent checkAllSettled calls
 
 // ── UI refs (set via initUI) ───────────────────────────────────────────────
 let _ui = {};
@@ -15,6 +16,7 @@ export function isActive() {
 }
 
 export function startSession(config) {
+  assembling = false;
   session = { ...config, done: 0, failed: 0 };
   session.poller = setInterval(pollDroppedPrompts, 2000);
   return session;
@@ -23,6 +25,7 @@ export function startSession(config) {
 export function endSession() {
   clearInterval(session?.poller);
   session = null;
+  assembling = false;
 }
 
 export function updateStatus(msg) {
@@ -43,8 +46,24 @@ export async function checkAllSettled() {
   if (!session) return;
   const total = session.total;
   if (session.done + session.failed < total) return;
+  if (assembling) return;
+  assembling = true;
 
   updateStatus("Assembling grid…");
+
+  // For any 'done' cell whose 'executed' WS event was missed, recover image from history
+  await Promise.all(
+    session.cells
+      .filter((c) => c.status === "done" && !c.image && c.promptId)
+      .map(async (cell) => {
+        try {
+          const hr = await api.fetchApi(`/history/${cell.promptId}`);
+          const hdata = await hr.json();
+          const imgs = hdata[cell.promptId]?.outputs?.[session.outputNodeId]?.images;
+          if (imgs?.length) cell.image = imgs[0];
+        } catch {}
+      })
+  );
 
   // Build 2D cells array
   const xCount = new Set(session.cells.map((c) => c.xi)).size;
@@ -80,6 +99,7 @@ export async function checkAllSettled() {
   clearInterval(session.poller);
   if (_ui.runBtn) _ui.runBtn.disabled = false;
   session = null;
+  assembling = false;
 }
 
 // ── WebSocket listeners ────────────────────────────────────────────────────
@@ -104,6 +124,7 @@ async function pollDroppedPrompts() {
       try {
         const hr = await api.fetchApi(`/history/${cell.promptId}`);
         const hdata = await hr.json();
+        if (cell.status !== "pending") continue; // WS event arrived while awaiting history
         const entry = hdata[cell.promptId];
         if (entry?.status?.status_str === "success") {
           // Completed normally but WS event lost or delayed — resolve from history
@@ -117,6 +138,7 @@ async function pollDroppedPrompts() {
           session.failed++;
         }
       } catch {
+        if (cell.status !== "pending") continue;
         cell.status = "failed";
         session.failed++;
       }
